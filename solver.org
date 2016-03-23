@@ -1,0 +1,301 @@
+#+TITLE: A combinatorial solver for Laplacian QP over box constraints.
+#+AUTHOR: Serge Kruk
+#+EMAIL: sgkruk@gmail.com
+#+DATE: $LastChangedDate: 2016-02-10 10:50:15 -0500 (Wed, 10 Feb 2016) $
+#+OPTIONS: ^:nil
+#+LATEX_CLASS: article
+#+OPTIONS: toc:nil
+#+LATEX_CLASS_OPTIONS: [10pt]
+#+LATEX_HEADER: \usepackage{geometry,listings,amsmath,amssymb,amsthm,algorithm2e}
+#+STARTUP: showall
+
+* Development of a combinatorial solver
+
+- Input is a vector of bounds (the box) $([a_1, b_1], ... , [a_N, b_N])$
+- Output is a vector $x$ where $x_i\in [a_i, b_i]$ 
+- The solution minimizes $\sum x_i^2 - \sum_i \sum_{j\ne i} x_i x_j$ 
+
+The code assumes that the input is of rational numbers. The output
+will also be rational. 
+
+
+** The objective function.  
+Not necessary for the current version of the solver.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun objective (x &optional (n 0) (acc 0))
+    (if (null x)
+        acc
+        (let* ((xi (car x))
+               (rest (cdr x))
+               (n (max n (length x))))
+          (incf acc (* xi xi (1- n)))
+          (incf acc (* 2 (reduce #'(lambda (a b) (- a (* xi b))) rest :initial-value 0)))
+          (objective rest n acc))))
+#+END_SRC
+
+#+RESULTS:
+: OBJECTIVE
+
+#+BEGIN_SRC python :tangle "solver.py"
+  def objective (x):
+      val,n = 0,len(x)
+      for i in range(len(x)):
+          val += (n-1)*x[i]*x[i]
+          for j in range(i+1, len(x)):
+              val += -2 * x[i] * x[j]
+      return val
+#+END_SRC
+#+RESULTS:
+: None
+
+** Find the initial \nu.
+We will try a few different approaches. 
+** Median of the mean of the boxes. 
+First find the median of means of the ranges, then find the boundary closest
+to this \nu, i.e. the first one equal or larger.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun flatten (l)
+    (cond ((null l) nil)
+          ((atom l) (list l))
+          (t (loop for a in l appending (flatten a)))))
+#+END_SRC
+
+#+RESULTS:
+: FLATTEN
+
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+    (defun initial-mean (ranges)
+      (let* ((mids (mapcar #'(lambda (range) (/ (+ (first range) (second range)) 2)) ranges))
+             (l (length mids))
+             (mid (truncate l 2))
+             (val (nth mid (sort mids #'<))))
+        (find val (sort (flatten ranges) #'<) :test #'<=)))
+#+END_SRC
+
+#+RESULTS:
+: INITIAL-MEAN
+
+** Get all potential boundary values.
+This returns a sorted vector of unique boundary values.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun potentials (ranges)
+    (remove-duplicates (sort (flatten ranges) #'<=)))
+#+END_SRC
+#+RESULTS:
+: POTENTIALS
+
+** Simple median of the unique boundary values.
+Returns the median and the index of the median element within
+potentials.  Makes it easy to update to the adjacent potential.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun initial-index (potentials)
+    (truncate (length potentials) 2))
+#+END_SRC
+
+#+RESULTS:
+: INITIAL-INDEX
+
+** Set the x vector to the 'closest' value to \nu in the range of each element
+This value is the lower bound, the upper bound or exactly \nu.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun closest-element (nu range)
+    (cond ((<= nu (first range)) (first range))
+          ((>= nu (second range)) (second range))
+          (t nu)))
+  (defun closest-vector (nu ranges)
+    (mapcar #'(lambda (range) (closest-element nu range)) ranges))
+#+END_SRC
+
+#+RESULTS:
+: CLOSEST-VECTOR
+
+** A simple computation of mean
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun arith-mean (x)
+    (/ (apply #'+ x) (length x)))
+#+END_SRC
+
+#+RESULTS:
+: ARITH-MEAN
+
+
+* Mainline
+We compute an initial solution by computing the median of the
+boundaries.  We then get the vector closest to this
+median. We loop, jumping from one boundary to the next, until we
+no longer improve. Finally, we compute the last step from the feasible
+descent direction.
+#+BEGIN_SRC lisp :tangle "solver.lisp" :exports none
+    (defun solver (ranges)
+      (do* ((potentials (potentials ranges))
+            (i (initial-index potentials) (+ i s))
+            (bar-nu (nth i potentials) (nth i potentials))
+            (x (closest-vector bar-nu ranges) (closest-vector bar-nu ranges))
+            (nu (arith-mean x) (arith-mean x))
+            (s (signum (- nu bar-nu)))
+            (steps 0 (1+ steps)))
+           ((or (zerop s) (not (= s (signum (- nu bar-nu)))))
+            (let* ((d (feasible-descent x ranges nu))
+                   (alpha (alpha nu bar-nu (length x) (abs (apply #'+ d)))))
+              (values (last-step x alpha d) steps)))))
+#+END_SRC
+
+#+RESULTS:
+: SOLVER
+
+** Find the direction of descent for the last step
+Once we have attained the minimum boundary, we have left to move the
+free variables towards the arithmetic mean.  This routine returns the
+direction in which to move. It has ones  only for the
+components of the variables that can move freely in the direction of
+the mean.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun feasible-descent (x ranges nu)
+    (mapcar #'(lambda (xi range)
+                (if (or
+                     (and (< xi nu) (<= (first range) xi) (< xi (second range)))
+                     (and (< nu xi) (< (first range) xi) (<= xi (second range))))
+                    1 0))
+            x ranges))
+#+END_SRC
+
+#+RESULTS:
+: FEASIBLE-DESCENT
+
+** Optimal steplength
+The optimal steplength is the ratio
+#+BEGIN_LaTeX
+  \begin{displaymath}
+    \frac{x^t Q d}{d^t Q d}
+  \end{displaymath}
+#+END_LaTeX
+which we compute combinatorially.  Its sign will depend whether the
+current iterate's free component can go up or down. It assumes that
+the vector of feasible direction is ones and zeros, not minus ones and
+zeros.
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun alpha (nu nu-bar n k)
+    (/ (* n (- nu nu-bar)) (- n k)))
+#+END_SRC
+
+#+RESULTS:
+: ALPHA
+
+** Last step computation
+From the last boundary vector, having computing the direction of
+maximal descent and the optimal steplength, we compute the last step.
+#+BEGIN_SRC lisp :tangle "solver.lisp"           
+  (defun last-step (x alpha d)
+    (mapcar #'(lambda (xi di) (+ xi (* alpha di))) x d))
+#+END_SRC
+
+#+RESULTS:
+: LAST-STEP
+
+* Some testing code
+We have an optimality check that verifies that the solution returned
+satisfies the optimality conditions, namely that every component is
+either at a boundary value or exactly at the mean. 
+#+BEGIN_SRC lisp :tangle "solver.lisp"
+  (defun optimal-p (x ranges)
+    (let ((nu (arith-mean x)))
+      (every #'identity (mapcar #'(lambda (xi range)
+                  (or
+                   (= xi (first range))
+                   (= xi (second range))
+                   (and (= xi nu) (<= (first range) nu (second range)))))
+              x ranges))))
+  (defun test-solver ()
+    (and 
+     (= 9 (objective '(3 6)))
+     (= 3 (initial-mean '((1 3) (1 3) (4 6))))
+     (equal '(1 2 3 4 6) (potentials '((1 3) (2 3) (4 6))))
+     (equal '(2 2 4) (closest-vector 2 '((1 3) (2 3) (4 6))))
+     (= 2 (next-nu 1 (potentials '((1 3) (2 3) (4 6))) 1))
+     (= 3 (next-nu 2 (potentials '((1 3) (2 3) (4 6))) 1))
+     (= 2 (next-nu 3 (potentials '((1 3) (2 3) (4 6))) -1))
+     (= 6 (next-nu 4 (potentials '((1 3) (2 3) (4 6))) 1))
+     (= 6 (next-nu 6 (potentials '((1 3) (2 3) (4 6))) 1))
+     (= 1 (next-nu 1 (potentials '((1 3) (2 3) (4 6))) -1))
+     (= 1 (let* ((ranges '((1 3) (2 3) (4 6)))
+                 (nu 1)
+                 (pot (potentials ranges))
+                 (x (closest-vector nu ranges))
+                 (val (objective x)))
+            (direction val nu pot ranges)))
+     (equal  '(6 3 16/3 7 16/3) (solver '((6 8) (1 3) (5 9) (7 9) (2 6))))
+     (equal '(3 14 14 11 100/7 16 100/7 14 100/7 28) 
+            (solver '((0 3) (3 14) (6 14) (1 11) (12 38) (16 17) (5 46) (11 14) (14 23) (28 64)))))
+    (dotimes (i 100)
+      (let ((ranges (gen-ranges 20)))
+        (when (not (optimal-p (solver ranges) ranges))
+          (format t "~%ERROR: range:~a" ranges)
+          )))
+    t)
+#+END_SRC
+#+RESULTS:
+: TEST-SOLVER
+
+* An experiment to verify runtime
+We generate a set of ranges and run the solver, keeping track of the
+number of steps in the algorithm.
+#+BEGIN_SRC lisp :exports both
+    (defun gen-ranges (n &optional acc)
+      (if (zerop n)
+          acc
+          (let* ((start (random (* 3 n)))
+                 (end (+ start 1 (random (* 6 n)))))
+            (gen-ranges (1- n) (cons (list start end) acc)))))
+
+  (defun experiment (ns)
+  (let ((results '(("n" "steps"))))
+    (dolist (n ns (nreverse results))
+      (let ((steps 0)
+            (nb 0))
+        (dotimes (i 20)
+          (multiple-value-bind (sol step) (solver (gen-ranges n))
+  ;;(print sol)
+            (incf steps step)
+            (incf nb)))
+        (push (list n (truncate steps nb)) results)))))
+  (experiment '(10 20 30 50 100 200 300 500 1000 5000 10000))
+#+END_SRC
+
+#+RESULTS:
+|     n | steps |
+|    10 |     1 |
+|    20 |     3 |
+|    30 |     3 |
+|    50 |     5 |
+|   100 |    10 |
+|   200 |    21 |
+|   300 |    31 |
+|   500 |    54 |
+|  1000 |   108 |
+|  5000 |   513 |
+| 10000 |  1047 |
+#+BEGIN_COMMENT
+VERSION 0
+Evaluation took:
+  46.773 seconds of real time
+  46.700000 seconds of total run time (46.700000 user, 0.000000 system)
+  99.84% CPU
+  168,386,529,416 processor cycles
+  717,150,016 bytes consed
+(("n" "steps") (10 2) (20 2) (30 4) (50 6) (100 10) (200 20) (300 30) (500 49)
+ (1000 94))
+
+VERSION 1
+Evaluation took:
+  0.213 seconds of real time
+  0.216000 seconds of total run time (0.196000 user, 0.020000 system)
+  [ Run times consist of 0.024 seconds GC time, and 0.192 seconds non-GC time. ]
+  101.41% CPU
+  765,672,318 processor cycles
+  154,849,088 bytes consed
+  
+(("n" "steps") (10 2) (20 3) (30 4) (50 7) (100 11) (200 22) (300 33) (500 53)
+ (1000 104))
+
+We could improve this by using vectors instead of lists.
+#+END_COMMENT
